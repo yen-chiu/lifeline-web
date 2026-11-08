@@ -3,8 +3,11 @@ import {
   parseStory, parseStrings, evalCondition, applySet, substitute,
   parseChoices, parseTransition, parseTextInput
 } from './engine.js';
+import {
+  capture, validate, toCode, fromCode, download, readFile,
+  slotKey, AUTO_KEY, LEGACY_KEY
+} from './save.js';
 
-const KEY = 'lifeline.web.save.v1';
 const PREFS = 'lifeline.web.prefs.v1';
 const DEFAULT_HINT = '信号已接入 · 回复会传回地面';
 const TOKEN_RE = /<<[^>]*>>|\[\[[^\]]*\]\]/g;
@@ -148,6 +151,14 @@ function resolveIf(tokens, i) {
   return { branches, after: tokens.length };
 }
 
+/** 段落末尾的存档：回退到最近的跳转/选择 token */
+function resumeIndex(tokens) {
+  for (let i = tokens.length - 1; i >= 0; i -= 1) {
+    if (tokens[i].type === 'choices' || tokens[i].type === 'link') return i;
+  }
+  return 0;
+}
+
 /* ---------------- 渲染与存档 ---------------- */
 
 let current = { passage: 'Start', idx: 0 };
@@ -181,21 +192,38 @@ async function say(text, myGen) {
   return true;
 }
 
-function saveState() {
-  try {
-    localStorage.setItem(KEY, JSON.stringify({
-      ver: 1, vars, log, passage: current.passage, idx: current.idx, ts: Date.now()
-    }));
-  } catch (_) { /* 隐私模式下静默失败 */ }
+let saveTimer = null;
+
+function snapshot() {
+  return capture({ passage: current.passage, idx: current.idx, vars, log });
 }
 
-function loadSave() {
-  try {
-    const raw = localStorage.getItem(KEY);
-    if (!raw) return null;
-    const s = JSON.parse(raw);
-    return s && s.ver === 1 ? s : null;
-  } catch (_) { return null; }
+function writeSave() {
+  saveTimer = null;
+  try { localStorage.setItem(AUTO_KEY, JSON.stringify(snapshot())); } catch (_) { /* 隐私模式下静默失败 */ }
+}
+
+function saveState() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(writeSave, 220);
+}
+
+function flushSave() {
+  if (!saveTimer) return;
+  clearTimeout(saveTimer);
+  writeSave();
+}
+
+function loadAutoSave() {
+  for (const key of [AUTO_KEY, LEGACY_KEY]) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const r = validate(JSON.parse(raw), story);
+      if (r.ok) return r.save;
+    } catch (_) { /* 忽略损坏的存档 */ }
+  }
+  return null;
 }
 
 function savePrefs() {
@@ -334,14 +362,18 @@ function askInput(ti) {
 
 async function runPassage(name, startIdx, myGen) {
   const tokens = story.get(name);
-  current = { passage: name, idx: startIdx };
+  // 存档可能停在段落末尾（最后一个 token 已消费、跳转尚未发生）；
+  // 这时回退到最近的跳转/选择 token，让玩家重新决策，而不是卡死。
+  let at = Math.max(0, Math.min(startIdx, tokens ? tokens.length : 0));
+  if (tokens && at >= tokens.length) at = resumeIndex(tokens);
+  current = { passage: name, idx: at };
   saveState();
   if (!tokens) { addMsg('sys', `（缺少段落：${name}）`); return; }
 
   const jumps = new Map();
   let silent = false;
 
-  for (let i = startIdx; i < tokens.length; ) {
+  for (let i = at; i < tokens.length; ) {
     if (myGen !== gen) return;
     if (jumps.has(i)) { i = jumps.get(i); continue; }
 
@@ -459,8 +491,136 @@ function restart() {
   log = [];
   chat.textContent = '';
   footHint.textContent = DEFAULT_HINT;
-  try { localStorage.removeItem(KEY); } catch (_) {}
+  try { localStorage.removeItem(AUTO_KEY); localStorage.removeItem(LEGACY_KEY); } catch (_) {}
   newRun('Start', 0);
+}
+
+/* ---------------- 存档界面 ---------------- */
+
+const saveModal = el('saveModal');
+const autoInfo = el('autoInfo');
+const slotsBox = el('slots');
+const codeBox = el('codeBox');
+const saveMsg = el('saveMsg');
+
+function setSaveMsg(text, isErr) {
+  saveMsg.textContent = text || '';
+  saveMsg.classList.toggle('err', Boolean(isErr));
+}
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString('zh-CN', {
+    hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+function describe(save) {
+  const n = (save.log || []).length;
+  return `${save.passage} · ${n} 条消息 · ${fmtTime(save.savedAt)}`;
+}
+
+function readSlot(n) {
+  try {
+    const raw = localStorage.getItem(slotKey(n));
+    if (!raw) return null;
+    const r = validate(JSON.parse(raw), story);
+    return r.ok ? r.save : null;
+  } catch (_) { return null; }
+}
+
+function renderSlots() {
+  slotsBox.textContent = '';
+  for (let n = 1; n <= 3; n += 1) {
+    const s = readSlot(n);
+    const row = document.createElement('div');
+    row.className = 'slot';
+
+    const info = document.createElement('div');
+    info.className = 'slot-info';
+    const name = document.createElement('div');
+    name.className = 'slot-name';
+    name.textContent = `槽位 ${n}`;
+    const meta = document.createElement('div');
+    meta.className = 'slot-meta';
+    meta.textContent = s ? describe(s) : '空';
+    info.append(name, meta);
+
+    const btnSave = document.createElement('button');
+    btnSave.type = 'button';
+    btnSave.className = 'ghost';
+    btnSave.textContent = '保存';
+    btnSave.addEventListener('click', () => {
+      try {
+        localStorage.setItem(slotKey(n), JSON.stringify(snapshot()));
+        renderSlots();
+        renderAutoInfo();
+        setSaveMsg(`已保存到槽位 ${n}`);
+      } catch (_) { setSaveMsg('保存失败：浏览器存储不可用', true); }
+    });
+
+    const btnLoad = document.createElement('button');
+    btnLoad.type = 'button';
+    btnLoad.className = 'ghost';
+    btnLoad.textContent = '读取';
+    btnLoad.disabled = !s;
+    btnLoad.addEventListener('click', () => { if (s) applySave(s, `已读取槽位 ${n}`); });
+
+    const btnDel = document.createElement('button');
+    btnDel.type = 'button';
+    btnDel.className = 'ghost';
+    btnDel.textContent = '删除';
+    btnDel.disabled = !s;
+    btnDel.addEventListener('click', () => {
+      try { localStorage.removeItem(slotKey(n)); } catch (_) {}
+      renderSlots();
+      setSaveMsg(`已删除槽位 ${n}`);
+    });
+
+    row.append(info, btnSave, btnLoad, btnDel);
+    slotsBox.appendChild(row);
+  }
+}
+
+function renderAutoInfo() {
+  autoInfo.textContent = `${describe(snapshot())}（自动存档）`;
+}
+
+function openSave() {
+  setSaveMsg('');
+  codeBox.value = '';
+  renderSlots();
+  renderAutoInfo();
+  saveModal.hidden = false;
+}
+
+function closeSave() { saveModal.hidden = true; }
+
+function applySave(rawSave, note) {
+  const r = validate(rawSave, story);
+  if (!r.ok) { setSaveMsg(r.error, true); return false; }
+  const s = r.save;
+  gen += 1;
+  clearInteractions();
+  vars = { ...s.vars };
+  log = s.log.map((m) => ({ ...m }));
+  if (!log.length) {
+    log.push({ k: 'sys', t: '（已从存档继续；进度码不含聊天记录，之前的消息不会显示）' });
+  }
+  chat.textContent = '';
+  el('splash').hidden = true;
+  el('app').hidden = false;
+  startAmbience();
+  rebuildChat();
+  newRun(s.passage, s.idx);
+  writeSave();
+  closeSave();
+  if (note) {
+    footHint.textContent = note;
+    setTimeout(() => { footHint.textContent = DEFAULT_HINT; }, 2600);
+  }
+  return true;
 }
 
 /* ---------------- 启动 ---------------- */
@@ -480,7 +640,7 @@ async function boot() {
   strings = parseStrings(stringsText);
   initAudio();
 
-  const save = loadSave();
+  const save = loadAutoSave();
   if (save && save.log && save.log.length) el('btn-continue').hidden = false;
 
   el('btn-start').addEventListener('click', () => {
@@ -490,7 +650,7 @@ async function boot() {
     vars = {};
     log = [];
     chat.textContent = '';
-    try { localStorage.removeItem(KEY); } catch (_) {}
+    try { localStorage.removeItem(AUTO_KEY); localStorage.removeItem(LEGACY_KEY); } catch (_) {}
     newRun('Start', 0);
   });
 
@@ -521,11 +681,77 @@ async function boot() {
 
   btnRestart.addEventListener('click', restart);
 
+  /* ---- 存档弹窗 ---- */
+  el('btn-save').addEventListener('click', openSave);
+  el('saveClose').addEventListener('click', closeSave);
+  saveModal.addEventListener('click', (e) => { if (e.target === saveModal) closeSave(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !saveModal.hidden) closeSave();
+  });
+
+  el('btn-export-file').addEventListener('click', () => {
+    download(snapshot());
+    setSaveMsg('已开始下载存档文件');
+  });
+
+  el('btn-import-file').addEventListener('click', () => el('fileInput').click());
+  el('fileInput').addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      applySave(await readFile(file), '已导入存档文件');
+    } catch (err) { setSaveMsg(err.message || '导入失败', true); }
+  });
+
+  el('btn-copy-code').addEventListener('click', async () => {
+    try {
+      const code = await toCode(snapshot());
+      codeBox.value = code;
+      codeBox.focus();
+      codeBox.select();
+      setSaveMsg('已生成进度码，正在尝试复制…');
+      // 剪贴板权限在某些浏览器里会一直挂起，不能阻塞界面
+      Promise.resolve(navigator.clipboard.writeText(code))
+        .then(() => setSaveMsg('进度码已复制到剪贴板'))
+        .catch(() => setSaveMsg('已生成进度码，请手动复制文本框内容'));
+    } catch (err) { setSaveMsg('生成进度码失败：' + err.message, true); }
+  });
+
+  el('btn-paste-code').addEventListener('click', async () => {
+    const fallback = () => {
+      codeBox.focus();
+      setSaveMsg('浏览器不允许读取剪贴板，请手动粘贴（Ctrl+V）', true);
+    };
+    try {
+      const text = await Promise.race([
+        navigator.clipboard.readText(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1200)),
+      ]);
+      codeBox.value = text;
+      setSaveMsg('已从剪贴板粘贴');
+    } catch (_) { fallback(); }
+  });
+
+  el('btn-import-code').addEventListener('click', async () => {
+    try {
+      applySave(await fromCode(codeBox.value), '已从进度码继续');
+    } catch (err) { setSaveMsg('进度码导入失败：' + err.message, true); }
+  });
+
+  window.addEventListener('pagehide', flushSave);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushSave();
+  });
+
   window.__ll = {
     vars: () => vars,
     current: () => current,
     passages: () => [...story.keys()],
     textOf: (name) => (story.get(name) || []).map((t) => t.type).slice(0, 40),
+    save: () => snapshot(),
+    apply: (s) => applySave(s, '已由调试接口导入'),
+    openSave,
   };
 }
 

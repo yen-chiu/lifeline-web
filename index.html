@@ -21,6 +21,7 @@
     <div class="tools">
       <button id="btn-speed" class="tool" type="button" title="切换等待时间：快速 / 真实">快进 · 开</button>
       <button id="btn-sound" class="tool" type="button" title="开关声音">声音 · 开</button>
+      <button id="btn-save" class="tool" type="button" title="存档、导入导出">存档</button>
       <button id="btn-restart" class="tool" type="button" title="从故事开头重新开始">重开</button>
     </div>
   </header>
@@ -58,6 +59,45 @@
     <p class="disclaimer">
       本页为非商业同人移植，剧情与美术版权归 3 Minute Games / Big Fish Games 所有。
     </p>
+  </div>
+</div>
+
+<div id="saveModal" class="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="saveTitle">
+    <header class="modal-head">
+      <h2 id="saveTitle">存档</h2>
+      <button id="saveClose" class="icon-btn" type="button" aria-label="关闭">×</button>
+    </header>
+
+    <section class="modal-sec">
+      <h3>当前进度</h3>
+      <p id="autoInfo" class="muted">—</p>
+      <div class="row">
+        <button id="btn-export-file" class="ghost" type="button">导出文件</button>
+        <button id="btn-import-file" class="ghost" type="button">导入文件</button>
+        <input id="fileInput" type="file" accept=".json,application/json" hidden>
+      </div>
+    </section>
+
+    <section class="modal-sec">
+      <h3>手动存档</h3>
+      <div id="slots" class="slots"></div>
+    </section>
+
+    <section class="modal-sec">
+      <h3>进度码</h3>
+      <p class="muted">进度码只含变量与当前位置，不含聊天记录，适合跨设备继续。</p>
+      <div class="row">
+        <button id="btn-copy-code" class="ghost" type="button">复制进度码</button>
+        <button id="btn-paste-code" class="ghost" type="button">粘贴进度码</button>
+      </div>
+      <textarea id="codeBox" rows="3" spellcheck="false" placeholder="把进度码粘贴到这里，再点“从进度码导入”"></textarea>
+      <div class="row">
+        <button id="btn-import-code" class="primary sm" type="button">从进度码导入</button>
+      </div>
+    </section>
+
+    <p id="saveMsg" class="save-msg" role="status"></p>
   </div>
 </div>
 
